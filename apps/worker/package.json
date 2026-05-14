@@ -1,0 +1,14 @@
+{
+  "name": "@repro/worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bootstrap-repro": "CI=true NODE_OPTIONS=--experimental-strip-types alchemy cloudflare bootstrap --worker-name alchemy-state-store-lightningcss-repro"
+  },
+  "dependencies": {
+    "alchemy": "2.0.0-beta.39",
+    "effect": "4.0.0-beta.66",
+    "@effect/platform-node": "4.0.0-beta.66"
+  }
+}
