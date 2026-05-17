@@ -10,5 +10,8 @@
     "alchemy": "2.0.0-beta.39",
     "effect": "4.0.0-beta.66",
     "@effect/platform-node": "4.0.0-beta.66"
+  },
+  "devDependencies": {
+    "vite": "7.3.1"
   }
 }

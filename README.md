@@ -1,8 +1,8 @@
 # alchemy + lightningcss bundling repro
 
-Minimal reproduction of an [alchemy](https://alchemy.run) v2 bundling failure in pnpm monorepos where lightningcss is reachable in the workspace.
+Minimal reproduction of an [alchemy](https://alchemy.run) v2 bundling failure that surfaces in any pnpm workspace using vite 7 + tailwind v4 (or any other path that makes pre-1.32 lightningcss reachable).
 
-**TL;DR**: running `alchemy cloudflare bootstrap` (or any operation that triggers state-store reconciliation) fails at the rolldown bundling step with `Could not resolve '../pkg' in lightningcss/node/index.js`, because alchemy bundles its own state-store Worker source (`lib/Cloudflare/StateStore/Api.js` → `lib/Cloudflare/Workers/Worker.js` → `loadVite()` → vite → lightningcss).
+**TL;DR**: `alchemy cloudflare bootstrap` (or any operation that triggers state-store reconciliation) fails at the rolldown bundling step with `Could not resolve '../pkg' in lightningcss/node/index.js`, because alchemy bundles its own state-store Worker source (`lib/Cloudflare/StateStore/Api.js` → `lib/Cloudflare/Workers/Worker.js` → `loadVite()` → vite → lightningcss). Rolldown follows the vite → lightningcss chain statically and trips on a dead-code WASM fallback `require('../pkg')` inside lightningcss < 1.32.0.
 
 ## The bug
 
@@ -13,7 +13,7 @@ The chain alchemy hits:
 ```
 [UNRESOLVED_IMPORT] Could not resolve '../pkg' in lightningcss/node/index.js
 imported by:
-  - vite/dist/node/chunks/node.js
+  - vite/dist/node/chunks/config.js
   - vite/dist/node/index.js
   - lib/Cloudflare/Workers/Worker.js
   - lib/Cloudflare/StateStore/Api.js
@@ -44,15 +44,31 @@ alchemy cloudflare bootstrap --worker-name alchemy-state-store-lightningcss-repr
 
 You should see the `Could not resolve '../pkg'` error, with the chain shown above.
 
-## Why it triggers here but not elsewhere
+## The scenario this models
 
-The bundler only reaches into lightningcss's source if **lightningcss is resolvable somewhere in the workspace**. This repo arranges that via `apps/styled/`, which has `@tailwindcss/postcss` as a devDependency — tailwind v4 pulls lightningcss in through `@tailwindcss/node`. The `styled` app's lightningcss is never imported in `apps/worker/` source, but pnpm's workspace-wide resolution makes it reachable when bundling.
+Two-app pnpm workspace:
 
-In alchemy's own dev workspace (or any workspace without tailwind v4 / another lightningcss-pulling dep), the bundler still walks the same `loadVite()` code path but lightningcss resolution simply fails-silently / tree-shakes, and the bundle succeeds. The trigger is **workspace lightningcss reachability**, not anything specific to the user's alchemy config.
+- **`apps/worker/`** — uses alchemy. Pins `vite: "7.3.1"` as a devDep (no explicit lightningcss anywhere).
+- **`apps/styled/`** — has `@tailwindcss/postcss@4.1.18` as a devDep. Nothing else. The `styled` app's `lightningcss` is never imported by `apps/worker/` source — but tailwind v4 brings it in via `@tailwindcss/node` (which has lightningcss `1.30.2` as a regular dep at this tailwind version), and pnpm satisfies vite 7's optional lightningcss peer from that.
 
-### The `pnpm.overrides.lightningcss` pin is load-bearing
+The trigger is structural:
 
-The root `package.json` pins `pnpm.overrides.lightningcss: "1.30.1"`. **The repro depends on this pin** — empirically, removing it causes pnpm to resolve to a different lightningcss arrangement where the alchemy bundle path no longer reaches into lightningcss's source, and the bundle succeeds. The failing chain still goes through vite 8 either way; the difference is in how pnpm wires up lightningcss relative to the bundle's resolution context. We haven't fully traced the mechanism, but the pin is required to reproduce.
+1. **Vite 7 has `lightningcss` as an optional peer dep** (`^1.21.0`). When something else in the workspace declares lightningcss (directly or transitively), pnpm wires it into vite's resolution.
+2. **Lightningcss < 1.32.0 contains `require('../pkg')`** — a runtime-conditional WASM-fallback that only executes if `CSS_TRANSFORMER_WASM=1` is set. The `pkg` directory only ships in the separate `lightningcss-wasm` package, not in standard installs.
+3. **Rolldown does static analysis** — it doesn't know the require is dead code; it just sees the string `'../pkg'` and tries to resolve a file that doesn't exist.
+4. **Alchemy's `Cloudflare.state()` reconciliation path bundles its own state-store Worker source**, which transitively reaches `loadVite()` (`await import("vite")`). Rolldown follows it, walks into vite's static reference to lightningcss, hits the `../pkg` line, fails.
+
+This is the "I didn't declare lightningcss anywhere, why is my deploy broken?" surprise — typical of pnpm workspaces where one app has tailwind v4 and another, unrelated app uses alchemy.
+
+### Why vite 7 specifically
+
+Vite 8 (released 2026-03-12) moved lightningcss from an optional peer to a regular dependency AND bumped the minimum version to `^1.32.0` — the version that incidentally dropped the `../pkg` line as part of [an unrelated visitor-API refactor](https://github.com/parcel-bundler/lightningcss/pull/1170). So workspaces that have already moved to vite 8 don't hit this — vite 8 pulls in a fixed lightningcss directly.
+
+Real-world workspaces stuck on vite 7 typically have it because of a peer constraint from another dep (e.g., `@shopify/hydrogen-react@2025.10.0` only accepted `vite: ^5.1.0 || ^6.2.1`, which pnpm satisfies with vite 7 via the path of least resistance), or because the lockfile hasn't been refreshed since vite 8 came out. Pinning `vite: 7.3.1` here mimics that situation.
+
+### Why this specific tailwind version
+
+`@tailwindcss/postcss@4.1.18` brings in `lightningcss@1.30.2` (which still has the `../pkg` line). The latest `@tailwindcss/postcss@4.3.0+` brings in `lightningcss@1.32.0` (no `../pkg`). The repro pins to `4.1.18` to keep the bug reproducible — any tailwind v4 version below `4.3.0` would work the same way.
 
 ## Cleanup
 
@@ -68,3 +84,4 @@ rm -rf apps/worker/.alchemy
 - The same chain trips for `state: Cloudflare.state()` deploys when the state-store is in **"owner" mode** (local state-store state files present) — alchemy reconciles the state-store on every deploy, which bundles its own state-store source the same way. The `bootstrap` command is the cleanest way to demonstrate the bundle failure standalone.
 - A user-side workaround for the `Cloudflare.state()` reconciliation case is to delete `apps/<your-app>/.alchemy/state/CloudflareStateStore/` so alchemy treats the state-store as opaque external infrastructure (uses the auth token from `~/.alchemy/credentials/` without reconciliation). Doesn't help with `bootstrap` — fresh accounts can't avoid creating a state-store somehow.
 - The proper fix lives in alchemy's rolldown config: `external: ['lightningcss', 'fsevents']` per the upstream rolldown maintainer's recommendation. That would protect every bundling path inside alchemy regardless of what's reachable in the consuming workspace.
+- Another structural fix would be tightening `@distilled.cloud/cloudflare-vite-plugin`'s vite peer from `^7.0.0 || ^8.0.0` to just `^8.0.0`. Alchemy already peers `vite: ^8.0.7` at the top level, so the plugin allowing vite 7 is the loose link letting older vite leak into the alchemy bundle chain.
