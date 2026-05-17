@@ -1,6 +1,6 @@
 # alchemy + lightningcss bundling repro
 
-Minimal reproduction of an [alchemy](https://alchemy.run) v2 bundling failure that surfaces in any pnpm workspace using vite 7 + tailwind v4 (or any other path that makes pre-1.32 lightningcss reachable).
+Minimal reproduction of an [alchemy](https://alchemy.run) v2 bundling failure that surfaces in pnpm workspaces with a frontend framework constraining vite to ≤7 (e.g. SvelteKit ≤2.52, hydrogen-react ≤2026.4.1, older Storybook builders) alongside tailwind v4.
 
 **TL;DR**: `alchemy cloudflare bootstrap` (or any operation that triggers state-store reconciliation) fails at the rolldown bundling step with `Could not resolve '../pkg' in lightningcss/node/index.js`, because alchemy bundles its own state-store Worker source (`lib/Cloudflare/StateStore/Api.js` → `lib/Cloudflare/Workers/Worker.js` → `loadVite()` → vite → lightningcss). Rolldown follows the vite → lightningcss chain statically and trips on a dead-code WASM fallback `require('../pkg')` inside lightningcss < 1.32.0.
 
@@ -46,29 +46,31 @@ You should see the `Could not resolve '../pkg'` error, with the chain shown abov
 
 ## The scenario this models
 
-Two-app pnpm workspace:
+Two-app pnpm workspace, **no explicit vite declaration anywhere**:
 
-- **`apps/worker/`** — uses alchemy. Pins `vite: "7.3.1"` as a devDep (no explicit lightningcss anywhere).
-- **`apps/styled/`** — has `@tailwindcss/postcss@4.1.18` as a devDep. Nothing else. The `styled` app's `lightningcss` is never imported by `apps/worker/` source — but tailwind v4 brings it in via `@tailwindcss/node` (which has lightningcss `1.30.2` as a regular dep at this tailwind version), and pnpm satisfies vite 7's optional lightningcss peer from that.
+- **`apps/worker/`** — uses alchemy. That's it. No vite pin.
+- **`apps/styled/`** — has `@sveltejs/kit@2.52.0` and `@tailwindcss/postcss@4.2.1` as devDeps. Nothing else.
 
-The trigger is structural:
+What happens at install time:
 
-1. **Vite 7 has `lightningcss` as an optional peer dep** (`^1.21.0`). When something else in the workspace declares lightningcss (directly or transitively), pnpm wires it into vite's resolution.
-2. **Lightningcss < 1.32.0 contains `require('../pkg')`** — a runtime-conditional WASM-fallback that only executes if `CSS_TRANSFORMER_WASM=1` is set. The `pkg` directory only ships in the separate `lightningcss-wasm` package, not in standard installs.
-3. **Rolldown does static analysis** — it doesn't know the require is dead code; it just sees the string `'../pkg'` and tries to resolve a file that doesn't exist.
-4. **Alchemy's `Cloudflare.state()` reconciliation path bundles its own state-store Worker source**, which transitively reaches `loadVite()` (`await import("vite")`). Rolldown follows it, walks into vite's static reference to lightningcss, hits the `../pkg` line, fails.
+1. **`@sveltejs/kit@2.52.0` declares `vite: "^5.0.3 || ^6.0.0 || ^7.0.0-beta.0"` as a peer** — explicitly rejects vite 8. (SvelteKit 2.53.0+ widened to include vite 8, but 2.52.0 was the last release before that change, published 2026-02-15.)
+2. **alchemy peers `vite: "^8.0.7"` (optional)** and its `@distilled.cloud/cloudflare-vite-plugin` dep peers `vite: "^7.0.0 || ^8.0.0"`. Both accept vite 7.
+3. **pnpm has to pick a single vite version** that satisfies the most peers. Vite 7 is the only version that satisfies SvelteKit + cloudflare-vite-plugin simultaneously. Picks **`vite@7.3.1`**.
+4. **`@tailwindcss/postcss@4.2.1` brings in `@tailwindcss/node@4.2.1`** which has `lightningcss@1.31.1` as a regular dep. Pnpm wires that lightningcss into vite 7's optional peer.
+5. **Lightningcss 1.31.1 still contains `require('../pkg')`** — a runtime-conditional WASM-fallback that never executes at runtime, but rolldown does static analysis and trips on it.
+6. **Alchemy's `Cloudflare.state()` reconciliation path bundles its own state-store Worker source**, which transitively reaches `loadVite()` (`await import("vite")`). Rolldown follows it, walks into vite's static reference to lightningcss, hits the `../pkg` line, fails.
 
-This is the "I didn't declare lightningcss anywhere, why is my deploy broken?" surprise — typical of pnpm workspaces where one app has tailwind v4 and another, unrelated app uses alchemy.
+This is the "I didn't declare vite or lightningcss anywhere, why is my deploy broken?" surprise — the kind of transitive-resolution mystery that's hard to debug without tracing the full peer chain.
 
-### Why vite 7 specifically
+### Why vite 7 gets picked (and how vite 8 fixed it upstream)
 
-Vite 8 (released 2026-03-12) moved lightningcss from an optional peer to a regular dependency AND bumped the minimum version to `^1.32.0` — the version that incidentally dropped the `../pkg` line as part of [an unrelated visitor-API refactor](https://github.com/parcel-bundler/lightningcss/pull/1170). So workspaces that have already moved to vite 8 don't hit this — vite 8 pulls in a fixed lightningcss directly.
+Vite 8 (released 2026-03-12) moved lightningcss from an optional peer to a regular dependency AND bumped the minimum version to `^1.32.0` — the version that incidentally dropped the `../pkg` line as part of [an unrelated visitor-API refactor](https://github.com/parcel-bundler/lightningcss/pull/1170). So workspaces on vite 8 don't hit this.
 
-Real-world workspaces stuck on vite 7 typically have it because of a peer constraint from another dep (e.g., `@shopify/hydrogen-react@2025.10.0` only accepted `vite: ^5.1.0 || ^6.2.1`, which pnpm satisfies with vite 7 via the path of least resistance), or because the lockfile hasn't been refreshed since vite 8 came out. Pinning `vite: 7.3.1` here mimics that situation.
+Workspaces stay on vite 7 when at least one dep's peer rejects vite 8. SvelteKit 2.52.0 is one example; older versions of `@shopify/hydrogen-react` (≤ 2026.4.1, `^5.1.0 || ^6.2.1`), `@sveltejs/kit` ≤ 2.52, older Storybook vite builders, and others fit the same pattern. Lockfile drift (workspace set up before vite 8 shipped) is another common path to the same end state.
 
 ### Why this specific tailwind version
 
-`@tailwindcss/postcss@4.1.18` brings in `lightningcss@1.30.2` (which still has the `../pkg` line). The latest `@tailwindcss/postcss@4.3.0+` brings in `lightningcss@1.32.0` (no `../pkg`). The repro pins to `4.1.18` to keep the bug reproducible — any tailwind v4 version below `4.3.0` would work the same way.
+`@tailwindcss/postcss@4.2.1` brings in `lightningcss@1.31.1` (which still has `../pkg`). `@tailwindcss/postcss@4.2.2+` bumped to `lightningcss@1.32.0` (no `../pkg`). The repro pins to `4.2.1` to keep the bug reproducible — any tailwind v4 version below `4.2.2` would work the same way.
 
 ## Cleanup
 
